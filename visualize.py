@@ -25,18 +25,22 @@ def find_checkpoint(path: Optional[str]) -> Path:
     raise FileNotFoundError("No checkpoint found. Provide --checkpoint or run training first.")
 
 
-def load_policy(checkpoint_path: Path, env: SnakeEnv, device: torch.device) -> ActorCritic:
+def load_policy(checkpoint_path: Path, env: SnakeEnv, device: torch.device):
     payload = torch.load(checkpoint_path, map_location=device)
-    model = ActorCritic(env.observation_size, env.action_size).to(device)
-    model.load_state_dict(payload["model_state"])
+    state = payload["model_state"]
+    model = ActorCritic(
+        env.observation_size, env.action_size, grid_shape=(6, env.grid_height, env.grid_width)
+    ).to(device)
+    model.load_state_dict(state, strict=True)
     model.eval()
     return model
 
 
 def select_action(model: ActorCritic, obs, device: torch.device) -> int:
-    obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+    vec_tensor = torch.tensor(obs["vec"], dtype=torch.float32, device=device).unsqueeze(0)
+    grid_tensor = torch.tensor(obs["grid"], dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
-        logits, _ = model(obs_tensor)
+        logits, _ = model(vec_tensor, grid_tensor)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
     return int(action.item())

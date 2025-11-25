@@ -69,6 +69,7 @@ class SnakeEnv:
         self.direction_idx = 1  # start moving right
         self.snake: Deque[Tuple[int, int]] = deque()
         self.food: tuple[int, int] = (0, 0)
+        self.last_grid: np.ndarray | None = None
         self.score = 0
         self.done = False
         self._obs_size = 7  # danger straight/left/right + food ahead/left/right/behind
@@ -95,6 +96,7 @@ class SnakeEnv:
         self.direction_idx = 1  # right
         self.snake = deque([(center_x - i, center_y) for i in range(SNAKE_INITIAL_LENGTH)])
         self.food = self._spawn_food()
+        self.last_grid = np.zeros((3, self.grid_height, self.grid_width), dtype=np.float32)
         self.score = 0
         self.done = False
         return self._get_obs()
@@ -194,38 +196,95 @@ class SnakeEnv:
             ],
             dtype=np.float32,
         )
-        return obs
+        grid = self._encode_grid()
+        return {"vec": obs, "grid": grid}
+
+    def _build_grid(self) -> np.ndarray:
+        # Channels: 0 food (1 at food position), 1 tail one-hot, 2 snake gradient (head=1 to tail=-1)
+        grid = np.zeros((3, self.grid_height, self.grid_width), dtype=np.float32)
+        food_x, food_y = self.food
+        grid[0, food_y, food_x] = 1.0
+
+        snake_list = list(self.snake)
+        length = len(snake_list)
+        if length > 0:
+            tail_x, tail_y = snake_list[-1]
+            grid[1, tail_y, tail_x] = 1.0
+            for idx, part in enumerate(snake_list):
+                # Head is idx=0 => value 1.0, tail is idx=length-1 => value -1.0
+                value = 1.0 - 2.0 * (idx / max(length - 1, 1))
+                grid[2, part[1], part[0]] = value
+        return grid
+
+    def _encode_grid(self) -> np.ndarray:
+        current = self._build_grid()
+        if self.last_grid is None:
+            prev = np.zeros_like(current)
+        else:
+            prev = self.last_grid
+        stacked = np.concatenate([current, prev], axis=0)
+        self.last_grid = current.copy()
+        return stacked
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_size: int, action_size: int, hidden_size: int = 128):
+    def __init__(
+        self,
+        obs_size: int,
+        action_size: int,
+        hidden_size: int = 128,
+        cnn_channels: int = 16,
+        grid_shape: tuple[int, int, int] | None = None,
+    ):
         super().__init__()
-        self.policy = nn.Sequential(
-            nn.Linear(obs_size, hidden_size),
+        self.grid_shape = grid_shape or (6, GRID_HEIGHT, GRID_WIDTH)
+        c, h, w = self.grid_shape
+        self.cnn = nn.Sequential(
+            nn.Conv2d(c, cnn_channels, kernel_size=5, stride=1, padding=2),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
+            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=5, stride=1, padding=2),
             nn.ReLU(),
-            nn.Linear(hidden_size, action_size),
+            nn.Flatten(),
         )
-        self.value = nn.Sequential(
+        with torch.no_grad():
+            dummy = torch.zeros(1, *self.grid_shape)
+            cnn_out = self.cnn(dummy)
+            self.cnn_out_dim = cnn_out.shape[1]
+
+        self.mlp = nn.Sequential(
             nn.Linear(obs_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.policy(x)
-        value = self.value(x).squeeze(-1)
+        fusion_dim = hidden_size + self.cnn_out_dim
+        self.policy_head = nn.Linear(fusion_dim, action_size)
+        self.value_head = nn.Linear(fusion_dim, 1)
+
+    def forward(self, vec_obs: torch.Tensor, grid_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        mlp_out = self.mlp(vec_obs)
+        cnn_out = self.cnn(grid_obs)
+        fused = torch.cat([mlp_out, cnn_out], dim=-1)
+        logits = self.policy_head(fused)
+        value = self.value_head(fused).squeeze(-1)
         return logits, value
 
-    def act(self, obs: np.ndarray | torch.Tensor) -> tuple[int, float, float]:
-        if isinstance(obs, np.ndarray):
-            obs_tensor = torch.from_numpy(obs).float().unsqueeze(0)
+    def act(
+        self, obs: dict[str, np.ndarray] | dict[str, torch.Tensor]
+    ) -> tuple[int, float, float]:
+        vec = obs["vec"]
+        grid = obs["grid"]
+        if isinstance(vec, np.ndarray):
+            vec_tensor = torch.from_numpy(vec).float().unsqueeze(0)
         else:
-            obs_tensor = obs.unsqueeze(0) if obs.dim() == 1 else obs
-        logits, value = self.forward(obs_tensor)
+            vec_tensor = vec.unsqueeze(0) if vec.dim() == 1 else vec
+        if isinstance(grid, np.ndarray):
+            grid_tensor = torch.from_numpy(grid).float().unsqueeze(0)
+        else:
+            grid_tensor = grid.unsqueeze(0) if grid.dim() == 3 else grid
+        logits, value = self.forward(vec_tensor, grid_tensor)
         dist = torch.distributions.Categorical(logits=logits)
         action = dist.sample()
-        return int(action.item()), float(dist.log_prob(action).item()), float(value.item())
+        log_prob = dist.log_prob(action)
+        return int(action.item()), float(log_prob.item()), float(value.item())

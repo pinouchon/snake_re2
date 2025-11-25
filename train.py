@@ -76,7 +76,12 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     env = SnakeEnv(seed=args.seed)
     obs = env.reset()
-    model = ActorCritic(env.observation_size, env.action_size, hidden_size=args.hidden_size).to(device)
+    model = ActorCritic(
+        env.observation_size,
+        env.action_size,
+        hidden_size=args.hidden_size,
+        grid_shape=(6, env.grid_height, env.grid_width),
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     global_step = 0
@@ -84,7 +89,8 @@ def main() -> None:
     episode_scores: List[int] = []
 
     while global_step < args.total_steps:
-        obs_buffer = []
+        vec_obs_buffer = []
+        grid_obs_buffer = []
         actions = []
         log_probs = []
         values = []
@@ -92,15 +98,17 @@ def main() -> None:
         dones = []
 
         for _ in range(args.rollout_steps):
-            obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            vec_tensor = torch.tensor(obs["vec"], dtype=torch.float32, device=device).unsqueeze(0)
+            grid_tensor = torch.tensor(obs["grid"], dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
-                logits, value = model(obs_tensor)
+                logits, value = model(vec_tensor, grid_tensor)
                 dist = Categorical(logits=logits)
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
 
             next_obs, reward, done, info = env.step(int(action.item()))
-            obs_buffer.append(obs)
+            vec_obs_buffer.append(obs["vec"])
+            grid_obs_buffer.append(obs["grid"])
             actions.append(int(action.item()))
             log_probs.append(float(log_prob.cpu().item()))
             values.append(float(value.cpu().item()))
@@ -116,13 +124,15 @@ def main() -> None:
                 break
 
         with torch.no_grad():
-            next_value_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            _, next_value = model(next_value_tensor)
+            next_vec_tensor = torch.tensor(obs["vec"], dtype=torch.float32, device=device).unsqueeze(0)
+            next_grid_tensor = torch.tensor(obs["grid"], dtype=torch.float32, device=device).unsqueeze(0)
+            _, next_value = model(next_vec_tensor, next_grid_tensor)
             next_value = float(next_value.cpu().item())
 
         advantages, returns = compute_gae(rewards, values, dones, next_value, args.gamma, args.gae_lambda)
 
-        obs_tensor = torch.tensor(np.array(obs_buffer), dtype=torch.float32, device=device)
+        vec_tensor = torch.tensor(np.array(vec_obs_buffer), dtype=torch.float32, device=device)
+        grid_tensor = torch.tensor(np.array(grid_obs_buffer), dtype=torch.float32, device=device)
         actions_tensor = torch.tensor(np.array(actions), dtype=torch.long, device=device)
         log_probs_tensor = torch.tensor(np.array(log_probs), dtype=torch.float32, device=device)
         advantages_tensor = torch.tensor(advantages, dtype=torch.float32, device=device)
@@ -130,14 +140,14 @@ def main() -> None:
 
         advantages_tensor = (advantages_tensor - advantages_tensor.mean()) / (advantages_tensor.std() + 1e-8)
 
-        batch_size = len(obs_buffer)
+        batch_size = len(vec_obs_buffer)
         for _ in range(args.ppo_epochs):
             idxs = torch.randperm(batch_size)
             for start in range(0, batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_idx = idxs[start:end]
 
-                logits, values_pred = model(obs_tensor[mb_idx])
+                logits, values_pred = model(vec_tensor[mb_idx], grid_tensor[mb_idx])
                 dist = Categorical(logits=logits)
                 new_log_probs = dist.log_prob(actions_tensor[mb_idx])
                 entropy = dist.entropy().mean()
