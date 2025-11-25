@@ -80,7 +80,7 @@ def main() -> None:
         env.observation_size,
         env.action_size,
         hidden_size=args.hidden_size,
-        grid_shape=(6, env.grid_height, env.grid_width),
+        grid_shape=(4, env.grid_height, env.grid_width),
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 

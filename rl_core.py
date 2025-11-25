@@ -9,8 +9,8 @@ import torch
 from torch import nn
 
 
-GRID_WIDTH = 10
-GRID_HEIGHT = 10
+GRID_WIDTH = 8
+GRID_HEIGHT = 8
 SNAKE_INITIAL_LENGTH = 3
 FOOD_REWARD = 1.0
 STEP_REWARD = -0.01
@@ -69,7 +69,6 @@ class SnakeEnv:
         self.direction_idx = 1  # start moving right
         self.snake: Deque[Tuple[int, int]] = deque()
         self.food: tuple[int, int] = (0, 0)
-        self.last_grid: np.ndarray | None = None
         self.score = 0
         self.done = False
         self._obs_size = 7  # danger straight/left/right + food ahead/left/right/behind
@@ -96,7 +95,6 @@ class SnakeEnv:
         self.direction_idx = 1  # right
         self.snake = deque([(center_x - i, center_y) for i in range(SNAKE_INITIAL_LENGTH)])
         self.food = self._spawn_food()
-        self.last_grid = np.zeros((3, self.grid_height, self.grid_width), dtype=np.float32)
         self.score = 0
         self.done = False
         return self._get_obs()
@@ -199,32 +197,25 @@ class SnakeEnv:
         grid = self._encode_grid()
         return {"vec": obs, "grid": grid}
 
-    def _build_grid(self) -> np.ndarray:
-        # Channels: 0 food (1 at food position), 1 tail one-hot, 2 snake gradient (head=1 to tail=-1)
-        grid = np.zeros((3, self.grid_height, self.grid_width), dtype=np.float32)
+    def _encode_grid(self) -> np.ndarray:
+        # One-hot channels: 0=head, 1=body (excluding head), 2=food, 3=empty
+        grid = np.zeros((4, self.grid_height, self.grid_width), dtype=np.float32)
+        # start with empty = 1 everywhere
+        grid[3, :, :] = 1.0
+
         food_x, food_y = self.food
-        grid[0, food_y, food_x] = 1.0
+        grid[2, food_y, food_x] = 1.0
+        grid[3, food_y, food_x] = 0.0
 
         snake_list = list(self.snake)
-        length = len(snake_list)
-        if length > 0:
-            tail_x, tail_y = snake_list[-1]
-            grid[1, tail_y, tail_x] = 1.0
-            for idx, part in enumerate(snake_list):
-                # Head is idx=0 => value 1.0, tail is idx=length-1 => value -1.0
-                value = 1.0 - 2.0 * (idx / max(length - 1, 1))
-                grid[2, part[1], part[0]] = value
+        if snake_list:
+            head_x, head_y = snake_list[0]
+            grid[0, head_y, head_x] = 1.0
+            grid[3, head_y, head_x] = 0.0
+            for part in snake_list[1:]:
+                grid[1, part[1], part[0]] = 1.0
+                grid[3, part[1], part[0]] = 0.0
         return grid
-
-    def _encode_grid(self) -> np.ndarray:
-        current = self._build_grid()
-        if self.last_grid is None:
-            prev = np.zeros_like(current)
-        else:
-            prev = self.last_grid
-        stacked = np.concatenate([current, prev], axis=0)
-        self.last_grid = current.copy()
-        return stacked
 
 
 class ActorCritic(nn.Module):
@@ -233,16 +224,16 @@ class ActorCritic(nn.Module):
         obs_size: int,
         action_size: int,
         hidden_size: int = 128,
-        cnn_channels: int = 16,
+        cnn_channels: int = 32,
         grid_shape: tuple[int, int, int] | None = None,
     ):
         super().__init__()
-        self.grid_shape = grid_shape or (6, GRID_HEIGHT, GRID_WIDTH)
+        self.grid_shape = grid_shape or (4, GRID_HEIGHT, GRID_WIDTH)
         c, h, w = self.grid_shape
         self.cnn = nn.Sequential(
-            nn.Conv2d(c, cnn_channels, kernel_size=5, stride=1, padding=2),
+            nn.Conv2d(c, cnn_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=5, stride=1, padding=2),
+            nn.Conv2d(cnn_channels, cnn_channels, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.Flatten(),
         )

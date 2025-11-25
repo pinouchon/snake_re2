@@ -29,7 +29,7 @@ def load_policy(checkpoint_path: Path, env: SnakeEnv, device: torch.device):
     payload = torch.load(checkpoint_path, map_location=device)
     state = payload["model_state"]
     model = ActorCritic(
-        env.observation_size, env.action_size, grid_shape=(6, env.grid_height, env.grid_width)
+        env.observation_size, env.action_size, grid_shape=(4, env.grid_height, env.grid_width)
     ).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()
